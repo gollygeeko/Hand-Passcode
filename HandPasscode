@@ -1,0 +1,356 @@
+/*
+ * HandPasscode.cpp
+ * Author: Olivia Winn
+ */
+
+#include <opencv/cv.h>
+#include <opencv/highgui.h>
+#include <stdio.h>
+
+using namespace cv;
+using namespace std;
+
+#define RANDPOSE   0
+#define FLAT 		1
+#define OPEN		2
+#define FIST 		3
+#define KNIFE 		4
+
+#define RANDPLACE	0
+#define CENTER		1
+#define CORNER		2
+#define RIGHT		3
+#define LEFT		4
+
+vector<int> pose;
+vector<int> position;
+
+/*
+ * Contour finding and bounding ellipse code based on OpenCV tutorial
+ */
+Mat computeData(Mat hand, int k)
+{
+//Size down the image and pick out just hand-ish colored areas
+	Mat scaled = Mat::zeros(Size(hand.cols/10, hand.rows/10), hand.type());
+	resize(hand, scaled, scaled.size(), 0, 0, INTER_AREA);
+	Mat justHand;
+	inRange(scaled, Scalar(0, 0, 170, 0), Scalar(255, 255, 255, 0), justHand);
+
+//Get a contour of each blob, and find a best-fit ellipse around it
+	Mat contour;
+	vector<vector<Point> > contours;
+	vector<Vec4i> hierarchy;
+	threshold( justHand, contour, 100, 255, THRESH_BINARY );
+	findContours( contour, contours, hierarchy, CV_RETR_TREE, CV_CHAIN_APPROX_SIMPLE, Point(0, 0) );
+
+
+	vector<Point> handContour;
+	RotatedRect minEllipse;
+	int maxSize = 5;
+	for( int i = 0; i < contours.size(); i++ )
+	{
+	 	if( contours[i].size() > maxSize)
+	    {
+	 		minEllipse = fitEllipse(Mat(contours[i]));
+	 		maxSize = contours[i].size();
+	 		handContour = contours[i];
+	    }
+	}
+
+	//Determine the convexity defects - for use in distinguishing the open hand
+	vector<int> hullIndices;
+	vector<Vec4i> convexDefects;
+	convexHull(handContour, hullIndices, true);
+	convexityDefects(handContour, hullIndices, convexDefects);
+
+	//Draw the calculations that have been made to better see them work
+	Mat calcHand;
+	cvtColor(justHand, calcHand, CV_GRAY2BGR);
+	ellipse(calcHand, minEllipse, Scalar(255, 0, 0), 2, 8 );
+	circle(calcHand, minEllipse.center, 2, Scalar(0, 0, 255), 2, 8);
+
+  	Size ellipseSize = minEllipse.size;
+  	float ratio = ellipseSize.height / ((float)ellipseSize.width);
+
+  	//Used to study the different ratios and determine optimal ranges for each pose
+  	//cout << ratio << endl;
+
+  	/* After sampling many images, it was determined that using these ranges for the ratio
+  	 * of height to width of the hand best generally encapsulated the different gestures.
+  	 * This assumes that the user is wearing a long-sleeve shirt - the arm would otherwise
+  	 * be included in the blob and completely throw off the ratios
+  	 *
+  	 * The open pose is the only one with  a number of large deviations from the contour,
+  	 * so this can be checked for first. The other poses can be reasonably separated by
+  	 * height/width ratio
+  	 */
+  	bool largeDefects = false;
+	for (int i = 0; i < convexDefects.size(); i++)
+	{
+		int depth = convexDefects[i][2]; // Gives depth of defect information
+		if (depth > 200)
+			largeDefects = true;
+	}
+	if (largeDefects && ratio < 1.4) // There is also a ratio for the open hand - useful
+		pose.push_back(OPEN);
+  	else if (ratio < 1.3)
+		pose.push_back(FIST);
+	else if (ratio < 2.3)
+		pose.push_back(FLAT);
+	else if (ratio < 3.3)
+		pose.push_back(KNIFE);
+	else
+		pose.push_back(RANDPOSE);
+	cout << pose.size() << endl;
+
+	/*The division of space to determine hand position was chosen through experimentation.
+	 * It seemed that the best method was to base the corner spaces on the size of the
+	 * hand pose, since that determined just how close the center could get to the edges.
+	 * From trial and error, it seemed that the smaller the dimension, the larger the scalar
+	 * needed to be in that direction, while the larger dimensions needed smaller scalars.
+	 * This allowed each pose about the same amount of freedom in each position, which feels
+	 * more natural to use.
+	 * For the center however, the same size area was used for each, since that is easy for
+	 * any position to fit into.
+	 */
+	float widthDiv;
+	float heightDiv;
+	if (pose[k] == FIST)
+	{
+		widthDiv = ellipseSize.width * 0.9;
+		heightDiv = ellipseSize.height * 0.9;
+	}
+	else if (pose[k] == OPEN)
+	{
+		widthDiv = ellipseSize.width * 0.7;
+		heightDiv = ellipseSize.height * 0.7;
+	}
+	else if (pose[k] == FLAT)
+	{
+		widthDiv = ellipseSize.width * 0.7;
+		heightDiv = ellipseSize.height * 0.7;
+	}
+	else // pose is knife
+	{
+		widthDiv = ellipseSize.width * 0.9;
+		heightDiv = ellipseSize.height * 0.7;
+	}
+
+	float centerWDiv = justHand.cols/4;
+	float centerHDiv = justHand.rows/4;
+
+	Point2f eCenter = minEllipse.center;
+	Point2f imageCenter = Point2f(calcHand.cols/2, calcHand.rows/2);
+
+	//If it is a knife pose, the only positions are LEFT or RIGHT
+	//Check this first so the other calculations are not done on a knife pose
+	if (pose[k] == KNIFE)
+	{
+		if (eCenter.x < imageCenter.x)
+			position.push_back(LEFT);
+		else if (eCenter.x > imageCenter.x)
+			position.push_back(RIGHT);
+	}
+
+	//Check if it is in the center
+	else if (eCenter.x > imageCenter.x - (centerWDiv/2)
+				&& eCenter.x < imageCenter.x + (centerWDiv/2))
+		{
+			if (eCenter.y > imageCenter.y - (centerHDiv/2)
+					&& eCenter.y < imageCenter.y + (centerHDiv/2))
+				position.push_back(CENTER);
+			else
+				position.push_back(RANDPLACE);
+		}
+	//Or one of the corners
+	else if (eCenter.x < widthDiv || eCenter.x > calcHand.cols - widthDiv)
+	{
+		if (eCenter.y < heightDiv || eCenter.y > calcHand.rows - heightDiv)
+			position.push_back(CORNER);
+		else
+			position.push_back(RANDPLACE);
+	}
+	else
+		position.push_back(RANDPLACE);
+	cout << position.size() << endl;
+
+	/* This set of lines is to display the bounding boxes for determining the position of
+	 * the hand
+	 */
+	//Upper left corner
+	line(calcHand, Point2f(0, heightDiv), Point2f(widthDiv, heightDiv), Scalar(0, 200, 0),
+			2, 8);
+	line(calcHand, Point2f(widthDiv, 0), Point2f(widthDiv, heightDiv), Scalar(0, 200, 0),
+			2, 8);
+	//Lower left corner
+	line(calcHand, Point2f(0, calcHand.rows-heightDiv),
+			Point2f(widthDiv, calcHand.rows-heightDiv), Scalar(0, 200, 0), 2, 8);
+	line(calcHand, Point2f(widthDiv, calcHand.rows-heightDiv),
+			Point2f(widthDiv, calcHand.rows), Scalar(0, 200, 0), 2, 8);
+	//Upper right corner
+	line(calcHand, Point2f(calcHand.cols-widthDiv, heightDiv),
+			Point2f(calcHand.cols, heightDiv), Scalar(0, 200, 0), 2, 8);
+	line(calcHand, Point2f(calcHand.cols-widthDiv, 0),
+			Point2f(calcHand.cols-widthDiv, heightDiv), Scalar(0, 200, 0), 2, 8);
+	//Lower right corner
+	line(calcHand, Point2f(calcHand.cols-widthDiv, calcHand.rows-heightDiv),
+			Point2f(calcHand.cols, calcHand.rows-heightDiv), Scalar(0, 200, 0), 2, 8);
+	line(calcHand, Point2f(calcHand.cols-widthDiv, calcHand.rows-heightDiv),
+			Point2f(calcHand.cols-widthDiv, calcHand.rows), Scalar(0, 200, 0), 2, 8);
+	//Center
+	line(calcHand, Point2f(imageCenter.x-centerWDiv/2, imageCenter.y-centerHDiv/2), Point2f
+			(imageCenter.x-centerWDiv/2, imageCenter.y+centerHDiv/2), Scalar(0, 200, 0), 2, 8);
+	line(calcHand, Point2f(imageCenter.x-centerWDiv/2, imageCenter.y-centerHDiv/2), Point2f
+			(imageCenter.x+centerWDiv/2, imageCenter.y-centerHDiv/2), Scalar(0, 200, 0), 2, 8);
+	line(calcHand, Point2f(imageCenter.x+centerWDiv/2, imageCenter.y-centerHDiv/2), Point2f
+			(imageCenter.x+centerWDiv/2, imageCenter.y+centerHDiv/2), Scalar(0, 200, 0), 2, 8);
+	line(calcHand, Point2f(imageCenter.x-centerWDiv/2, imageCenter.y+centerHDiv/2), Point2f
+			(imageCenter.x+centerWDiv/2, imageCenter.y+centerHDiv/2), Scalar(0, 200, 0), 2, 8);
+
+	return calcHand;
+}
+
+/*
+ * Check for flat hands starting from the beginning and simply remove them - they are the
+ * default "ignore" position and are removed first - this allows any pauses in the middle
+ * of a knife swipe to be successfully ignored
+ */
+
+void checkFlat()
+{
+	for (int i = 0; i < pose.size(); i++)
+	{
+		if (pose[i] == FLAT)
+		{
+			pose.erase(pose.begin() + i);
+			position.erase(position.begin() + i);
+			cout << "flat" << pose.size() << endl;
+			i --;
+		}
+	}
+}
+
+/* This method checks through the list of poses and positions to determine if the correct
+ * passcode was given. It takes care of any special symbols that require changing what is
+ * looked at in the image sequence, but if there is a mistake and not enough poses are left,
+ * it checks for that as well
+ * The passcode is a fist in the upper left corner, an open hand in the center, and then
+ * a fist in either lower corner
+ *
+ * 1 is correct, 0 is unknown, and -1 is incorrect
+ *
+ * CREATIVE: Two reset abilities - knife hand on the right side followed by knife hand on
+ * the left side means ignore this and everything before, and an open palm in the center
+ * is a resting position that can be ignored,
+ */
+int checkForCombo()
+{
+	//First check for any flat hands and remove them - they would otherwise get in the way
+	//of the knife swipe check
+	checkFlat();
+
+	/*
+	 * Then check to see if the user ever resets - no point in analyzing
+	 * anything before that
+	 * Since only the last reset matters, and only the knife poses have positions defined by
+	 * only left or right, this loop goes backwards, and simply checks for a left position
+	 * "followed" by a right position (right to left normally)
+	 */
+	for (int i = position.size()-1; i >= 0; i--)
+	{
+		if (position[i] == LEFT)
+		{
+			if (position[i-1] == RIGHT)
+			{
+				for (int j = 0; j <= i; j++)
+				{
+					pose.erase(pose.begin());
+					position.erase(position.begin());
+				}
+				i = -1;
+			}
+		}
+	}
+
+	//Make sure there are at least two images for the passcode -
+	//less is incorrect but more has no effect
+	if (pose.size() < 2 || position.size() < 2)
+	{
+		cout << pose.size() << endl;
+		cout << "wrong" << endl;
+		return -1;
+	}
+
+	//First check to see if the computer understood each image - if it didn't respond with ?
+	if (pose[0] == RANDPOSE || pose[1] == RANDPOSE
+		|| position[0] == RANDPLACE || position[1] == RANDPLACE)
+		return 0;
+
+	//Then check the specific sequence for the passcode
+	if (pose[0] == OPEN && position[0] == CENTER)
+	{
+		if (pose[1] == FIST && position[1] == CORNER)
+		{
+			return 1;
+		}
+	}
+
+	//If it did and something was wrong, say so
+	return -1;
+}
+
+
+
+int main( int argc, char** argv )
+{
+	//Since the passcode requires three separate gestures, at least 3 images should be given
+	if( argc < 3)
+	{
+		printf( "Please supply at least two images" );
+		return -1;
+	}
+
+	//Go through the images and gather all the important data
+	for (int i = 1; i < argc; i++)
+	{
+		Mat image = imread(argv[i]);
+		Mat computedHand = computeData(image, i - 1);
+
+		//Let the user know how each image was processed to understand when something
+		//goes wrong
+
+		cout << "Pose: " << pose[i-1] << endl;
+		cout << "Position: " << position[i-1] << endl;
+
+		/* This was to display the altered image and the characteristics determined in
+		 * real time so any errors could be quickly assessed, and to give the user a sense
+		 * of how position was calculated (in case they though they put their hand in a
+		 * corner but were off).
+		 */
+
+		string name = static_cast<ostringstream*>( &(ostringstream() << i) )->str();
+		namedWindow(name, CV_WINDOW_AUTOSIZE);
+		imshow(name, computedHand);
+
+
+
+	}
+
+	//Check the sequence of images
+	int correct = checkForCombo();
+	String answer = "Incorrect";
+	if (correct == 1)
+		answer = "Correct";
+	else if (correct == 0)
+		answer = "Unknown";
+
+	//Let the user know if they got it
+	cout << answer << endl;
+
+	//This is so the images don't close until the user presses a key
+	waitKey(0);
+
+	return 0;
+}
+
+
